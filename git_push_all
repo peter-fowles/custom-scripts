@@ -38,262 +38,171 @@
 #
 # ==============================================================================
 
-# Fix for "fatal: not a git repository" errors across filesystems.
-export GIT_DISCOVERY_ACROSS_FILESYSTEM=1
-
-# Source common functions
 source "$(dirname "$0")/git_common.sh"
 
-# --- Configuration ---
-
-# File to load default settings from
-CONF_FILE="$(dirname "$0")/default_values.conf"
-
-# Initialize variables to be populated from the config file or defaults
-declare -a default_authors=()
-declare -a default_ignored_dirs=()
-
-# Load settings from the config file if it exists
-if [[ -f "$CONF_FILE" ]]; then
-  echo -e "${CYAN}Loading configuration from: ${BOLD}$CONF_FILE${NC}"
-  source "$CONF_FILE"
-else
-  echo -e "${YELLOW}Warning:${NC} No configuration file found at '$CONF_FILE'. Using empty defaults." >&2
-fi
-
-# --- Argument Parsing ---
-
+# --- Script-specific variables ---
 global_commit_message=""
 user_ignored_dirs=""
 user_authors=""
 is_list_mode=false
 is_verbose_list=false
 is_interactive_mode=false
+format_quoted=false
 root_directory="$(pwd)"
-
 timestamp=$(date +"%Y/%m/%d %H:%M:%S")
 commit_message="Automated commit $timestamp"
 
 usage() {
-  echo -e "${BOLD}Usage:${NC} $0 [<directory>] [-m <commit_message>] [-i <dir1,dir2,...>] [-l [-v]] [-p] [-h] [-a <author1,author2,...>]"
-  echo ""
-  echo -e "${BOLD}Arguments:${NC}"
-  echo "  <directory>               Optional. The root directory to start searching for Git repos."
-  echo "                            Defaults to the current working directory."
-  echo ""
-  echo -e "${BOLD}Options:${NC}"
-  echo "  -m <commit_message>       Optional. Use a custom commit message for all repositories (overridden in interactive mode)."
-  echo "  -i <dir1,dir2,...>        Optional. Append additional directories to the ignore list."
-  echo "                            Provide a comma-separated string with no spaces."
-  echo "  -l                        List all repositories and their status."
-  echo "  -v                        Used with -l to give verbose output (list files changed)."
-  echo "  -p                        Run in interactive mode, prompting per repository."
-  echo "  -h                        Display this help message and exit."
-  echo "  -a <author1,author2,...>  Filter to only include repositories where one of the specified authors has ever committed."
-  echo "                            Provide a comma-separated string with no spaces."
-  exit 1
+    echo -e "${BOLD}Usage:${NC} $0 [<directory>] [-m <commit_message>] [-i <dir1,dir2,...>] [-l [-v]] [-p] [-h] [-a <author1,author2,...>]"
+    echo ""
+    echo -e "${BOLD}Arguments:${NC}"
+    echo "  <directory>               Optional. The root directory to start searching for Git repos."
+    echo "                            Defaults to the current working directory."
+    echo ""
+    echo -e "${BOLD}Options:${NC}"
+    echo "  -m <commit_message>       Optional. Use a custom commit message for all repositories (overridden in interactive mode)."
+    echo "  -i <dir1,dir2,...>        Optional. Append additional directories to the ignore list."
+    echo "                            Provide a comma-separated string with no spaces."
+    echo "  -l                        List all repositories and their status."
+    echo "  -v                        Used with -l to give verbose output (list files changed)."
+    echo "  -p                        Run in interactive mode, prompting per repository."
+    echo "  -h                        Display this help message and exit."
+    echo "  -a <author1,author2,...>  Filter to only include repositories where one of the specified authors has ever committed."
+    echo "                            Provide a comma-separated string with no spaces."
+    exit 1
 }
-
-# Parse command-line arguments and validate
-while [[ "$#" -gt 0 ]]; do
-  case "$1" in
-    -m)
-      if [[ -z "$2" || "$2" == -* ]]; then
-        echo -e "${RED}Error:${NC} '-m' requires a commit message." >&2
-        usage
-      fi
-      global_commit_message="$2"
-      shift
-      ;;
-    -i)
-      if [[ -z "$2" || "$2" == -* ]]; then
-        echo -e "${RED}Error:${NC} '-i' requires a list of directories." >&2
-        usage
-      fi
-      user_ignored_dirs="$2"
-      shift
-      ;;
-    -a)
-      if [[ -z "$2" || "$2" == -* ]]; then
-        echo -e "${RED}Error:${NC} '-a' requires a list of authors." >&2
-        usage
-      fi
-      user_authors="$2"
-      shift
-      ;;
-    -l)
-      is_list_mode=true
-      ;;
-    -v)
-      is_verbose_list=true
-      ;;
-    -p)
-      is_interactive_mode=true
-      ;;
-    -h)
-      usage
-      ;;
-    -*)
-      echo -e "${RED}Invalid option:${NC} $1" >&2
-      usage
-      ;;
-    *)
-      if [[ "$root_directory" != "$(pwd)" ]]; then
-        echo -e "${RED}Error:${NC} Cannot specify multiple directories. Already set to '${BOLD}$root_directory${NC}'." >&2
-        usage
-      fi
-      root_directory="$1"
-      ;;
-  esac
-  shift
-done
-
-# Perform post-parsing validation
-if [[ "$is_verbose_list" = true && "$is_list_mode" = false ]]; then
-  echo -e "${RED}Error:${NC} The '-v' flag can only be used in conjunction with '-l'." >&2
-  usage
-fi
-
-if [[ "$is_interactive_mode" = true && "$is_list_mode" = true ]]; then
-  echo -e "${RED}Error:${NC} Interactive mode ('-p') and list mode ('-l') cannot be used together." >&2
-  usage
-fi
-
-if [[ -n "$global_commit_message" ]]; then
-  commit_message="$global_commit_message"
-fi
-
-all_ignored_dirs=("${default_ignored_dirs[@]}")
-if [[ -n "$user_ignored_dirs" ]]; then
-  IFS=',' read -ra user_dirs_array <<< "$user_ignored_dirs"
-  all_ignored_dirs=("${user_dirs_array[@]}")
-fi
-
-declare -A unique_dirs
-for dir in "${all_ignored_dirs[@]}"; do
-  unique_dirs["$dir"]=1
-done
-final_ignored_dirs=("${!unique_dirs[@]}")
-
-all_authors=("${default_authors[@]}")
-if [[ -n "$user_authors" ]]; then
-  IFS=',' read -ra user_authors_array <<< "$user_authors"
-  all_authors=("${user_authors_array[@]}")
-fi
-final_authors="${user_authors:-${all_authors[*]}}"
 
 # --- Core Script Logic ---
 
-if [[ ! -d "$root_directory" ]]; then
-  echo -e "${RED}Error:${NC} The specified directory '${BOLD}$root_directory${NC}' does not exist." >&2
-  exit 1
-fi
-
 process_single_repo() {
-  local git_dir="$1"
-  local repo_dir
-  repo_dir=$(dirname "$git_dir")
+    local git_dir="$1"
+    local repo_dir
+    repo_dir=$(dirname "$git_dir")
 
-  if ! git -C "$repo_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    return
-  fi
-
-  if ! has_upstream "$repo_dir"; then
-    return
-  fi
-
-  local author_filter_passed=false
-  if [[ -n "$final_authors" ]]; then
-    if has_author_commits "$repo_dir" "$final_authors"; then
-      author_filter_passed=true
-    fi
-  fi
-
-  if [[ -n "$final_authors" ]] && [[ "$author_filter_passed" == false ]]; then
-      return
-  fi
-
-  local has_changes=false
-  if git -C "$repo_dir" status --porcelain | grep -q .; then
-    has_changes=true
-  fi
-
-  if [[ -n "$final_authors" ]] && [[ "$author_filter_passed" == true ]] && [[ "$has_changes" == false ]]; then
-    echo -e "${YELLOW}Ignoring ${BOLD}$repo_dir${NC}: No changes to commit, but includes commits by given authors."
-    return
-  fi
-
-  if [[ "$is_list_mode" = true ]]; then
-    if [[ "$has_changes" = true ]]; then
-        echo -e "${YELLOW}Found pending changes in:${NC} ${BOLD}$repo_dir${NC}"
+    if ! git -C "$repo_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        return
     fi
 
-    if [[ "$is_verbose_list" = true && "$has_changes" = true ]]; then
-      local changed_files=$( { git -C "$repo_dir" diff --name-status; git -C "$repo_dir" diff --name-status --staged; } | sort -u )
-      echo "$changed_files" | awk '{print "  "$0}'
+    if ! has_upstream "$repo_dir"; then
+        return
     fi
-  elif [[ "$is_interactive_mode" = true ]]; then
-    if [[ "$has_changes" = true ]]; then
-      echo -e "\n${BOLD}--- Found pending changes in: ${CYAN}$repo_dir${NC}"
 
-      echo -e "\n${BOLD}--- Unstaged changes:${NC}"
-      git -C "$repo_dir" diff --color
-      echo -e "\n${BOLD}--- Staged changes:${NC}"
-      git -C "$repo_dir" diff --staged --color
+    local author_filter_passed=false
+    if [[ -n "${final_authors[*]}" ]]; then
+        if has_author_commits "$repo_dir" "${final_authors[@]}"; then
+            author_filter_passed=true
+        fi
+    fi
 
-      read -p "$(echo -e "${CYAN}Do you want to commit and push these changes? (y/n/s) [y=yes, n=no, s=skip all]: ${NC}")" -r user_choice
+    if [[ -n "${final_authors[*]}" ]] && [[ "$author_filter_passed" == false ]]; then
+        return
+    fi
 
-      case "$user_choice" in
-        [Yy]* )
-          read -p "$(echo -e "${CYAN}Enter custom commit message (default: \"$commit_message\"): ${NC}")" -r custom_message
-            if [[ -z "$custom_message" ]]; then
-              custom_message="$commit_message"
-            fi
-            if git -C "$repo_dir" add . && git -C "$repo_dir" commit -m "$custom_message" && git -C "$repo_dir" push; then
-              echo -e "${GREEN}--- Successfully committed and pushed in ${BOLD}$repo_dir${NC}."
+    local has_changes=false
+    if git -C "$repo_dir" status --porcelain | grep -q .; then
+        has_changes=true
+    fi
+
+    if [[ -n "${final_authors[*]}" ]] && [[ "$author_filter_passed" == true ]] && [[ "$has_changes" == false ]]; then
+        echo -e "${YELLOW}Ignoring ${BOLD}$repo_dir${NC}: No changes to commit, but includes commits by given authors."
+        return
+    fi
+
+    if [[ "$is_list_mode" = true ]]; then
+        if [[ "$has_changes" = true ]]; then
+            echo -e "${YELLOW}Found pending changes in:${NC} ${BOLD}$repo_dir${NC}"
+        fi
+
+        if [[ "$is_verbose_list" = true && "$has_changes" = true ]]; then
+            local changed_files=$( { git -C "$repo_dir" diff --name-status; git -C "$repo_dir" diff --name-status --staged; } | sort -u )
+            echo "$changed_files" | awk '{print "  "$0}'
+        fi
+    elif [[ "$is_interactive_mode" = true ]]; then
+        if [[ "$has_changes" = true ]]; then
+            echo -e "\n${BOLD}--- Found pending changes in: ${CYAN}$repo_dir${NC}"
+
+            echo -e "\n${BOLD}--- Unstaged changes:${NC}"
+            git -C "$repo_dir" diff --color
+            echo -e "\n${BOLD}--- Staged changes:${NC}"
+            git -C "$repo_dir" diff --staged --color
+
+            read -p "$(echo -e "${CYAN}Do you want to commit and push these changes? (y/n/s) [y=yes, n=no, s=skip all]: ${NC}")" -r user_choice
+
+            case "$user_choice" in
+                [Yy]* )
+                    read -p "$(echo -e "${CYAN}Enter custom commit message (default: \"$commit_message\"): ${NC}")" -r custom_message
+                    if [[ -z "$custom_message" ]]; then
+                        custom_message="$commit_message"
+                    fi
+                    if git -C "$repo_dir" add . && git -C "$repo_dir" commit -m "$custom_message" && git -C "$repo_dir" push; then
+                        echo -e "${GREEN}--- Successfully committed and pushed in ${BOLD}$repo_dir${NC}."
+                    else
+                        echo -e "${RED}--- Failed to commit or push in ${BOLD}$repo_dir${NC}. Please check manually."
+                    fi
+                    ;;
+                [Nn]* )
+                    echo -e "${YELLOW}--- Skipping commit for ${BOLD}$repo_dir${NC}."
+                    ;;
+                [Ss]* )
+                    echo -e "${YELLOW}--- Skipping ${BOLD}$repo_dir${NC} and all remaining repositories."
+                    exit 0
+                    ;;
+                * )
+                    echo -e "${RED}--- Invalid input. Skipping ${BOLD}$repo_dir${NC}."
+                    ;;
+            esac
+        fi
+    else
+        if [[ "$has_changes" = true ]]; then
+            echo -e "${BOLD}--- Entering repository:${NC} ${CYAN}$repo_dir${NC}"
+            if git -C "$repo_dir" add . && git -C "$repo_dir" commit -m "$commit_message" && git -C "$repo_dir" push; then
+                echo -e "${GREEN}--- Successfully committed and pushed in ${BOLD}$repo_dir${NC}."
             else
-              echo -e "${RED}--- Failed to commit or push in ${BOLD}$repo_dir${NC}. Please check manually."
+                echo -e "${RED}--- Failed to commit or push in ${BOLD}$repo_dir${NC}. Please check manually."
             fi
-            ;;
-        [Nn]* )
-          echo -e "${YELLOW}--- Skipping commit for ${BOLD}$repo_dir${NC}."
-          ;;
-        [Ss]* )
-          echo -e "${YELLOW}--- Skipping ${BOLD}$repo_dir${NC} and all remaining repositories."
-          exit 0
-          ;;
-        * )
-          echo -e "${RED}--- Invalid input. Skipping ${BOLD}$repo_dir${NC}."
-          ;;
-      esac
+        fi
     fi
-  else
-    if [[ "$has_changes" = true ]]; then
-      echo -e "${BOLD}--- Entering repository:${NC} ${CYAN}$repo_dir${NC}"
-      if git -C "$repo_dir" add . && git -C "$repo_dir" commit -m "$commit_message" && git -C "$repo_dir" push; then
-        echo -e "${GREEN}--- Successfully committed and pushed in ${BOLD}$repo_dir${NC}."
-      else
-        echo -e "${RED}--- Failed to commit or push in ${BOLD}$repo_dir${NC}. Please check manually."
-      fi
-    fi
-  fi
 }
 
+# --- Main Execution ---
+load_config
+parse_common_args root_directory user_ignored_dirs user_authors is_list_mode is_verbose_list is_interactive_mode format_quoted "$@"
 
-# --- Execute ---
+# Build final lists
+final_ignored_dirs=("${default_ignored_dirs[@]}")
+if [[ -n "$user_ignored_dirs" ]]; then
+    IFS=',' read -ra user_dirs_array <<< "$user_ignored_dirs"
+    final_ignored_dirs=("${user_dirs_array[@]}")
+fi
+final_authors=("${default_authors[@]}")
+if [[ -n "$user_authors" ]]; then
+    IFS=',' read -ra user_authors_array <<< "$user_authors"
+    final_authors=("${user_authors_array[@]}")
+fi
+final_authors="${user_authors:-${all_authors[*]}}"
 
-if [[ "$is_list_mode" = false ]]; then
-  echo -e "${BOLD}Starting git_push_all...${NC}"
-  if [[ -n "$global_commit_message" ]]; then
-    echo -e "Using global commit message: '${CYAN}$global_commit_message${NC}'"
-  fi
-  if [[ -n "$final_authors" ]]; then
-    echo -e "Filtering by authors: '${CYAN}$final_authors${NC}'"
-  else
-    echo -e "No author filter specified, processing all repositories."
-  fi
+# Post-parsing validation for push
+if [[ "$is_verbose_list" = true && "$is_list_mode" = false ]]; then
+    echo -e "${RED}Error:${NC} The '-v' flag can only be used in conjunction with '-l'." >&2
+    exit 1
+fi
+if [[ "$is_interactive_mode" = true && "$is_list_mode" = true ]]; then
+    echo -e "${RED}Error:${NC} Interactive mode ('-p') and list mode ('-l') cannot be used together." >&2
+    exit 1
+fi
+if [[ -n "$global_commit_message" ]]; then
+    commit_message="$global_commit_message"
 fi
 
+# Main execution logic for push
+if [[ "$is_list_mode" = false ]]; then
+    echo -e "${BOLD}Starting git_push_all...${NC}"
+    if [[ -n "$global_commit_message" ]]; then
+        echo -e "Using global commit message: '${CYAN}$global_commit_message${NC}'"
+    fi
+fi
+if [[ -n "${final_authors[*]}" ]]; then
+    echo -e "Filtering by authors: '${CYAN}${final_authors[*]}${NC}'"
+fi
 process_repos_common "$root_directory" "${final_ignored_dirs[@]}"
-
 echo -e "\n${BOLD}Finished git_push_all.${NC}"

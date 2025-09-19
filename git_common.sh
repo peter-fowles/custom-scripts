@@ -1,6 +1,12 @@
 #!/bin/bash
 
-# --- Shared Utility Functions ---
+# Define ANSI color codes
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m' # No Color
 
 # Check if a repository has any commits by the specified authors
 has_author_commits() {
@@ -30,7 +36,6 @@ has_upstream() {
 }
 
 # Process repositories with shared find command logic
-# Takes the root directory and the final ignored directories array
 process_repos_common() {
   local root_directory="$1"
   local final_ignored_dirs=("${@:2}")
@@ -58,10 +63,82 @@ process_repos_common() {
   rm "$temp_file"
 }
 
-# Define ANSI color codes
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m' # No Color
+# --- NEW: General Argument and Configuration Handling ---
+
+load_config() {
+  # Path to the shared, example configuration file
+  local CONF_FILE_EXAMPLE="$(dirname "$0")/default_values.conf.example"
+  # Path to the local, uncommitted configuration file
+  local CONF_FILE_LOCAL="$(dirname "$0")/default_values.conf"
+
+  # Initialize temporary arrays to hold values from config files
+  declare -a authors_from_local=()
+  declare -a ignored_dirs_from_local=()
+  declare -a authors_from_global=()
+  declare -a ignored_dirs_from_global=()
+
+  # Load local settings first
+  if [[ -f "$CONF_FILE_LOCAL" ]]; then
+    echo -e "${CYAN}Loading local overrides from: ${BOLD}$CONF_FILE_LOCAL${NC}"
+    source <(grep -v '^declare' "$CONF_FILE_LOCAL" | sed 's/default_authors/authors_from_local/;s/default_ignored_dirs/ignored_dirs_from_local/')
+  fi
+
+  # Load global settings
+  if [[ -f "$CONF_FILE_EXAMPLE" ]]; then
+    echo -e "${CYAN}Loading global defaults from: ${BOLD}$CONF_FILE_EXAMPLE${NC}"
+    source <(grep -v '^declare' "$CONF_FILE_EXAMPLE" | sed 's/default_authors/authors_from_global/;s/default_ignored_dirs/ignored_dirs_from_global/')
+  fi
+
+  # Merge and deduplicate the authors arrays
+  declare -A unique_authors_map
+  for author in "${authors_from_local[@]}" "${authors_from_global[@]}"; do
+    [[ -n "$author" ]] && unique_authors_map["$author"]=1
+  done
+  default_authors=("${!unique_authors_map[@]}")
+
+  # Merge and deduplicate the ignored directories arrays
+  declare -A unique_ignored_dirs_map
+  for dir in "${ignored_dirs_from_local[@]}" "${ignored_dirs_from_global[@]}"; do
+    [[ -n "$dir" ]] && unique_ignored_dirs_map["$dir"]=1
+  done
+  default_ignored_dirs=("${!unique_ignored_dirs_map[@]}")
+}
+
+parse_args() {
+  local script_name="${1}"
+  shift
+  
+  local ARGS
+  ARGS=$(getopt -o dqh -l help,directories,quoted --name "$script_name" -- "$@")
+
+  eval set -- "$ARGS"
+
+  while true; do
+    case "$1" in
+      -d|--directories)
+        export show_directories=true
+        shift
+        ;;
+      -q|--quoted)
+        export format_quoted=true
+        shift
+        ;;
+      -h|--help)
+        usage
+        ;;
+      --)
+        shift
+        break
+        ;;
+      *)
+        echo "Invalid argument: $1" >&2
+        usage
+        ;;
+    esac
+  done
+
+  # Handle positional arguments
+  if [[ -n "$1" ]]; then
+    export root_directory="$1"
+  fi
+}

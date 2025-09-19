@@ -36,200 +36,130 @@
 #
 # ==============================================================================
 
-# Fix for "fatal: not a git repository" errors across filesystems.
-export GIT_DISCOVERY_ACROSS_FILESYSTEM=1
-
-# Source common functions
 source "$(dirname "$0")/git_common.sh"
 
-# --- Configuration ---
-
-# File to load default settings from
-CONF_FILE="$(dirname "$0")/default_values.conf"
-
-# Initialize variables to be populated from the config file or defaults
-declare -a default_authors=()
-declare -a default_ignored_dirs=()
-
-# Load settings from the config file if it exists
-if [[ -f "$CONF_FILE" ]]; then
-  echo -e "${CYAN}Loading configuration from: ${BOLD}$CONF_FILE${NC}"
-  source "$CONF_FILE"
-else
-  echo -e "${YELLOW}Warning:${NC} No configuration file found at '$CONF_FILE'. Using empty defaults." >&2
-fi
-
-# --- Argument Parsing ---
-
+# --- Script-specific variables ---
 user_ignored_dirs=""
 user_authors=""
 is_list_mode=false
 is_verbose_list=false
+format_quoted=false
+is_interactive_mode=false # Not used, but needed for the common function
 root_directory="$(pwd)"
 
 usage() {
-  echo -e "${BOLD}Usage:${NC} $0 [<directory>] [-i <dir1,dir2,...>] [-l [-v]] [-h] [-a <author1,author2,...>]"
-  echo ""
-  echo -e "${BOLD}Arguments:${NC}"
-  echo "  <directory>               Optional. The root directory to start searching for Git repos."
-  echo "                            Defaults to the current working directory."
-  echo ""
-  echo -e "${BOLD}Options:${NC}"
-  echo "  -i <dir1,dir2,...>        Optional. Append additional directories to the ignore list."
-  echo "                            Provide a comma-separated string with no spaces."
-  echo "  -l                        List all repositories and their pull status."
-  echo "  -v                        Used with -l to give verbose output (show files changed after fetch)."
-  echo "  -h                        Display this help message and exit."
-  echo "  -a <author1,author2,...>  Filter to only include repositories where one of the specified authors has ever committed."
-  echo "                            Provide a comma-separated string with no spaces."
-  exit 1
+    echo -e "${BOLD}Usage:${NC} $0 [<directory>] [-i <dir1,dir2,...>] [-l [-v]] [-h] [-a <author1,author2,...>]"
+    echo ""
+    echo -e "${BOLD}Arguments:${NC}"
+    echo "  <directory>               Optional. The root directory to start searching for Git repos."
+    echo "                            Defaults to the current working directory."
+    echo ""
+    echo -e "${BOLD}Options:${NC}"
+    echo "  -i <dir1,dir2,...>        Optional. Append additional directories to the ignore list."
+    echo "                            Provide a comma-separated string with no spaces."
+    echo "  -l                        List all repositories and their pull status."
+    echo "  -v                        Used with -l to give verbose output (show files changed after fetch)."
+    echo "  -h                        Display this help message and exit."
+    echo "  -a <author1,author2,...>  Filter to only include repositories where one of the specified authors has ever committed."
+    echo "                            Provide a comma-separated string with no spaces."
+    exit 1
 }
-
-# Parse command-line arguments and validate
-while [[ "$#" -gt 0 ]]; do
-  case "$1" in
-    -i)
-      if [[ -z "$2" || "$2" == -* ]]; then
-        echo -e "${RED}Error:${NC} '-i' requires a list of directories." >&2
-        usage
-      fi
-      user_ignored_dirs="$2"
-      shift
-      ;;
-    -a)
-      if [[ -z "$2" || "$2" == -* ]]; then
-        echo -e "${RED}Error:${NC} '-a' requires a list of authors." >&2
-        usage
-      fi
-      user_authors="$2"
-      shift
-      ;;
-    -l)
-      is_list_mode=true
-      ;;
-    -v)
-      is_verbose_list=true
-      ;;
-    -h)
-      usage
-      ;;
-    -*)
-      echo -e "${RED}Invalid option:${NC} $1" >&2
-      usage
-      ;;
-    *)
-      if [[ "$root_directory" != "$(pwd)" ]]; then
-        echo -e "${RED}Error:${NC} Cannot specify multiple directories. Already set to '${BOLD}$root_directory${NC}'." >&2
-        usage
-      fi
-      root_directory="$1"
-      ;;
-  esac
-  shift
-done
-
-# Perform post-parsing validation
-if [[ "$is_verbose_list" = true && "$is_list_mode" = false ]]; then
-  echo -e "${RED}Error:${NC} The '-v' flag can only be used in conjunction with '-l'." >&2
-  usage
-fi
-
-all_ignored_dirs=("${default_ignored_dirs[@]}")
-if [[ -n "$user_ignored_dirs" ]]; then
-  IFS=',' read -ra user_dirs_array <<< "$user_ignored_dirs"
-  all_ignored_dirs=("${user_dirs_array[@]}")
-fi
-declare -A unique_dirs
-for dir in "${all_ignored_dirs[@]}"; do
-  unique_dirs["$dir"]=1
-done
-final_ignored_dirs=("${!unique_dirs[@]}")
-
-all_authors=("${default_authors[@]}")
-if [[ -n "$user_authors" ]]; then
-  IFS=',' read -ra user_authors_array <<< "$user_authors"
-  all_authors=("${user_authors_array[@]}")
-fi
-final_authors="${user_authors:-${all_authors[*]}}"
 
 # --- Core Script Logic ---
 
-if [[ ! -d "$root_directory" ]]; then
-  echo -e "${RED}Error:${NC} The specified directory '${BOLD}$root_directory${NC}' does not exist." >&2
-  exit 1
-fi
-
 process_single_repo() {
-  local git_dir="$1"
-  local repo_dir
-  repo_dir=$(dirname "$git_dir")
+    local git_dir="$1"
+    local repo_dir
+    repo_dir=$(dirname "$git_dir")
 
-  if ! git -C "$repo_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    return
-  fi
-
-  if ! has_upstream "$repo_dir"; then
-    return
-  fi
-
-  local author_filter_passed=false
-  if [[ -n "$final_authors" ]]; then
-    if has_author_commits "$repo_dir" "$final_authors"; then
-      author_filter_passed=true
-    fi
-  fi
-
-  if [[ -n "$final_authors" ]] && [[ "$author_filter_passed" == false ]]; then
-      return
-  fi
-
-  git -C "$repo_dir" fetch --quiet 2>/dev/null
-  local_behind_remote=false
-  if [[ -n $(git -C "$repo_dir" log HEAD..@{u} --oneline 2>/dev/null) ]]; then
-      local_behind_remote=true
-  fi
-
-  if [[ "$is_list_mode" = true ]]; then
-    if [[ "$local_behind_remote" = true ]]; then
-      echo -e "${YELLOW}Updates available in:${NC} ${BOLD}$repo_dir${NC}"
-    elif [[ -n "$final_authors" ]] && [[ "$author_filter_passed" == true ]]; then
-      echo -e "${YELLOW}Updates checked in:${NC} ${BOLD}$repo_dir${NC} (no updates available)."
+    if ! git -C "$repo_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        return
     fi
 
-    if [[ "$is_verbose_list" = true && "$local_behind_remote" = true ]]; then
-      local changed_files=$(git -C "$repo_dir" diff --name-status HEAD..@{u})
-      echo "$changed_files" | awk '{print "  "$0}'
+    if ! has_upstream "$repo_dir"; then
+        return
     fi
-  else
-    if [[ "$local_behind_remote" = true ]]; then
-      echo -e "${BOLD}--- Pulling updates in:${NC} ${CYAN}$repo_dir${NC}"
-      if git -C "$repo_dir" pull; then
-        echo -e "${GREEN}--- Successfully pulled updates in ${BOLD}$repo_dir${NC}."
-      else
-        echo -e "${RED}--- Failed to pull updates in ${BOLD}$repo_dir${NC}. Please check manually."
-      fi
-      echo -e "--- Finished with repository: ${CYAN}$repo_dir${NC}"
-      echo ""
-    elif [[ -n "$final_authors" ]] && [[ "$author_filter_passed" == true ]]; then
-      echo -e "No updates available in: ${BOLD}$repo_dir${NC}"
+
+    local author_filter_passed=false
+    if [[ -n "${final_authors[*]}" ]]; then
+        if has_author_commits "$repo_dir" "${final_authors[@]}"; then
+            author_filter_passed=true
+        fi
     fi
-  fi
+
+    if [[ -n "${final_authors[*]}" ]] && [[ "$author_filter_passed" == false ]]; then
+        return
+    fi
+
+    git -C "$repo_dir" fetch --quiet 2>/dev/null
+    local_behind_remote=false
+    if [[ -n $(git -C "$repo_dir" log HEAD..@{u} --oneline 2>/dev/null) ]]; then
+        local_behind_remote=true
+    fi
+
+    if [[ "$is_list_mode" = true ]]; then
+        if [[ "$local_behind_remote" = true ]]; then
+            echo -e "${YELLOW}Updates available in:${NC} ${BOLD}$repo_dir${NC}"
+        elif [[ -n "${final_authors[*]}" ]] && [[ "$author_filter_passed" == true ]]; then
+            echo -e "${YELLOW}Updates checked in:${NC} ${BOLD}$repo_dir${NC} (no updates available)."
+        fi
+
+        if [[ "$is_verbose_list" = true && "$local_behind_remote" = true ]]; then
+            local changed_files=$(git -C "$repo_dir" diff --name-status HEAD..@{u})
+            echo "$changed_files" | awk '{print "  "$0}'
+        fi
+    else
+        if [[ "$local_behind_remote" = true ]]; then
+            echo -e "${BOLD}--- Pulling updates in:${NC} ${CYAN}$repo_dir${NC}"
+            if git -C "$repo_dir" pull; then
+                echo -e "${GREEN}--- Successfully pulled updates in ${BOLD}$repo_dir${NC}."
+            else
+                echo -e "${RED}--- Failed to pull updates in ${BOLD}$repo_dir${NC}. Please check manually."
+            fi
+            echo -e "--- Finished with repository: ${CYAN}$repo_dir${NC}"
+            echo ""
+        elif [[ -n "${final_authors[*]}" ]] && [[ "$author_filter_passed" == true ]]; then
+            echo -e "No updates available in: ${BOLD}$repo_dir${NC}"
+        fi
+    fi
 }
 
-# --- Execute ---
+# --- Main Execution ---
+load_config
+parse_common_args root_directory user_ignored_dirs user_authors is_list_mode is_verbose_list is_interactive_mode format_quoted "$@"
 
-if [[ "$is_list_mode" = true ]]; then
-  echo -e "${BOLD}Listing all Git repositories in '${CYAN}$root_directory${NC}':"
-else
-  echo -e "${BOLD}Starting automated Git pull...${NC}"
-  echo -e "Root directory: ${CYAN}$root_directory${NC}"
+# Build final lists
+final_ignored_dirs=("${default_ignored_dirs[@]}")
+if [[ -n "$user_ignored_dirs" ]]; then
+    IFS=',' read -ra user_dirs_array <<< "$user_ignored_dirs"
+    final_ignored_dirs=("${user_dirs_array[@]}")
+fi
+final_authors=("${default_authors[@]}")
+if [[ -n "$user_authors" ]]; then
+    IFS=',' read -ra user_authors_array <<< "$user_authors"
+    final_authors=("${user_authors_array[@]}")
+fi
+final_authors="${user_authors:-${all_authors[*]}}"
+
+# Post-parsing validation for pull
+if [[ "$is_verbose_list" = true && "$is_list_mode" = false ]]; then
+    echo -e "${RED}Error:${NC} The '-v' flag can only be used in conjunction with '-l'." >&2
+    exit 1
 fi
 
-if [[ -n "$final_authors" ]]; then
-  echo -e "Filtering by authors: '${CYAN}$final_authors${NC}'"
+# Main execution logic for pull
+if [[ "$is_list_mode" = true ]]; then
+    echo -e "${BOLD}Listing all Git repositories in '${CYAN}$root_directory${NC}':"
+else
+    echo -e "${BOLD}Starting automated Git pull...${NC}"
+    echo -e "Root directory: ${CYAN}$root_directory${NC}"
+fi
+
+if [[ -n "${final_authors[*]}" ]]; then
+    echo -e "Filtering by authors: '${CYAN}${final_authors[*]}${NC}'"
 fi
 if [[ ${#final_ignored_dirs[@]} -gt 0 ]]; then
-  echo -e "Ignoring directories: ${YELLOW}${final_ignored_dirs[*]}${NC}"
+    echo -e "Ignoring directories: ${YELLOW}${final_ignored_dirs[*]}${NC}"
 fi
 echo ""
 process_repos_common "$root_directory" "${final_ignored_dirs[@]}"

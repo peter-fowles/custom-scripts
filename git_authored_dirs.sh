@@ -5,7 +5,7 @@
 #
 # Features:
 #   - Lists directories of Git repositories that have commits from any author
-#     defined in `default_values.conf`.
+#     defined in `default_values.conf` or `default_values.conf.example`.
 #   - Does not ignore any directories during the search.
 #   - Robust error handling for invalid arguments.
 #   - Color-coded output for improved readability.
@@ -29,26 +29,18 @@ export GIT_DISCOVERY_ACROSS_FILESYSTEM=1
 source "$(dirname "$0")/git_common.sh"
 
 # --- Configuration ---
-
-# File to load default settings from
-CONF_FILE="$(dirname "$0")/default_values.conf"
-
-# Initialize variables to be populated from the config file or defaults
+# Variables are populated by load_config
 declare -a default_authors=()
 declare -a default_ignored_dirs=()
 declare -a authored_directories=()
 
-# Load settings from the config file if it exists
-if [[ -f "$CONF_FILE" ]]; then
-  echo -e "${CYAN}Loading configuration from: ${BOLD}$CONF_FILE${NC}"
-  source "$CONF_FILE"
-else
-  echo -e "${YELLOW}Warning:${NC} No configuration file found at '$CONF_FILE'. Using empty defaults." >&2
-fi
-
 # --- Argument Parsing ---
-
+# Variables are populated by parse_args
 root_directory="$(pwd)"
+user_ignored_dirs=""
+is_list_mode=false
+is_verbose_list=false
+user_authors=""
 
 usage() {
   echo -e "${BOLD}Usage:${NC} $0 [<directory>] [-h]"
@@ -62,33 +54,7 @@ usage() {
   exit 1
 }
 
-# Parse command-line arguments and validate
-while [[ "$#" -gt 0 ]]; do
-  case "$1" in
-    -h)
-      usage
-      ;;
-    -*)
-      echo -e "${RED}Invalid option:${NC} $1" >&2
-      usage
-      ;;
-    *)
-      if [[ "$root_directory" != "$(pwd)" ]]; then
-        echo -e "${RED}Error:${NC} Cannot specify multiple directories. Already set to '${BOLD}$root_directory${NC}'." >&2
-        usage
-      fi
-      root_directory="$1"
-      ;;
-  esac
-  shift
-done
-
 # --- Core Script Logic ---
-
-if [[ ! -d "$root_directory" ]]; then
-  echo -e "${RED}Error:${NC} The specified directory '${BOLD}$root_directory${NC}' does not exist." >&2
-  exit 1
-fi
 
 process_single_repo() {
   local git_dir="$1"
@@ -99,13 +65,22 @@ process_single_repo() {
     return
   fi
 
-  # Corrected: Pass all array elements as separate arguments
+  # Check if any default authors have commits in this repo
   if has_author_commits "$repo_dir" "${default_authors[@]}"; then
     authored_directories+=("$repo_dir")
   fi
 }
 
 # --- Execute ---
+
+# Load configuration and parse arguments
+load_config
+parse_args "$0" "$@"
+
+if [[ ! -d "$root_directory" ]]; then
+  echo -e "${RED}Error:${NC} The specified directory '${BOLD}$root_directory${NC}' does not exist." >&2
+  exit 1
+fi
 
 echo -e "${BOLD}Finding directories contributed to by default authors in '${CYAN}$root_directory${NC}'...${NC}"
 
