@@ -75,7 +75,7 @@ process_single_repo() {
 
 # Load configuration and parse arguments
 load_config
-parse_args "$0" "$@"
+parse_args "$0" "" "" "$@"
 
 if [[ ! -d "$root_directory" ]]; then
   echo -e "${RED}Error:${NC} The specified directory '${BOLD}$root_directory${NC}' does not exist." >&2

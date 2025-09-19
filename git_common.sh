@@ -106,10 +106,25 @@ load_config() {
 
 parse_args() {
   local script_name="${1}"
-  shift
+  local short_opts="${2}"
+  local long_opts="${3}"
+  local extra_args=("${@:4}")
+
+  # Temporary usage function for immediate help requests
+  usage_temp() {
+    echo -e "${BOLD}Usage:${NC} $script_name [<directory>] [OPTIONS]"
+    echo "This is a temporary help message. Please see the full script's documentation."
+    exit 1
+  }
+  
+  # Check for -h/--help explicitly before parsing
+  if [[ "$*" =~ "-h" || "$*" =~ "--help" ]]; then
+    usage
+    exit 0
+  fi
   
   local ARGS
-  ARGS=$(getopt -o dqh -l help,directories,quoted --name "$script_name" -- "$@")
+  ARGS=$(getopt -o "$short_opts" -l "$long_opts" --name "$script_name" -- "${extra_args[@]}")
 
   eval set -- "$ARGS"
 
@@ -123,8 +138,29 @@ parse_args() {
         export format_quoted=true
         shift
         ;;
-      -h|--help)
-        usage
+      -i|--ignore-dirs)
+        export user_ignored_dirs="$2"
+        shift 2
+        ;;
+      -a|--authors)
+        export user_authors="$2"
+        shift 2
+        ;;
+      -m|--message)
+        export global_commit_message="$2"
+        shift 2
+        ;;
+      -p|--interactive)
+        export is_interactive_mode=true
+        shift
+        ;;
+      -l|--list)
+        export is_list_mode=true
+        shift
+        ;;
+      -v|--verbose)
+        export is_verbose_list=true
+        shift
         ;;
       --)
         shift
