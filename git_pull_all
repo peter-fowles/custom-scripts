@@ -10,50 +10,65 @@
 #   - Verbose list mode (-lv) to also show changed files after a fetch.
 #   - Robust error handling for invalid arguments and non-Git directories.
 #   - Color-coded output for improved readability.
+#   - External configuration via `default_values.conf`.
+#   - Filter repositories to include only those with commits by specified authors (-a).
+#   - Suppresses output for ignored directories.
+#   - Ignore repos without a configured upstream remote.
 #
 # Usage:
-#   gpa [<directory>] [-i <dir1,dir2,...>] [-l [-v]] [-h]
+#   git_pull_all [<directory>] [-i <dir1,dir2,...>] [-l [-v]] [-h] [-a <author1,author2,...>]
 #
 # Examples:
 #   # Pull all repos in the current directory
-#   gpa
+#   git_pull_all
 #
 #   # Pull all repos in a specific directory
-#   gpa ~/projects
+#   git_pull_all ~/projects
 #
 #   # List all repos and their pull status, ignoring the 'temp' directory
-#   gpa -l -i "temp"
+#   git_pull_all -l -i "temp"
 #
 #   # Verbose list, showing files changed after a dry run pull
-#   gpa -lv
+#   git_pull_all -lv
+#
+#   # Pull changes only in repos with commits by 'John Doe' or 'jane@example.com'
+#   git_pull_all -a "John Doe,jane@example.com"
 #
 # ==============================================================================
 
 # Fix for "fatal: not a git repository" errors across filesystems.
 export GIT_DISCOVERY_ACROSS_FILESYSTEM=1
 
+# Source common functions
+source "$(dirname "$0")/git_common.sh"
+
 # --- Configuration ---
 
-# Define the default directories to ignore
-default_ignored_dirs=("node_modules" "vendor" "build" ".venv")
+# File to load default settings from
+CONF_FILE="$(dirname "$0")/default_values.conf"
 
-# Define ANSI color codes
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m' # No Color
+# Initialize variables to be populated from the config file or defaults
+declare -a default_authors=()
+declare -a default_ignored_dirs=()
+
+# Load settings from the config file if it exists
+if [[ -f "$CONF_FILE" ]]; then
+  echo -e "${CYAN}Loading configuration from: ${BOLD}$CONF_FILE${NC}"
+  source "$CONF_FILE"
+else
+  echo -e "${YELLOW}Warning:${NC} No configuration file found at '$CONF_FILE'. Using empty defaults." >&2
+fi
 
 # --- Argument Parsing ---
 
 user_ignored_dirs=""
+user_authors=""
 is_list_mode=false
 is_verbose_list=false
 root_directory="$(pwd)"
 
 usage() {
-  echo -e "${BOLD}Usage:${NC} $0 [<directory>] [-i <dir1,dir2,...>] [-l [-v]] [-h]"
+  echo -e "${BOLD}Usage:${NC} $0 [<directory>] [-i <dir1,dir2,...>] [-l [-v]] [-h] [-a <author1,author2,...>]"
   echo ""
   echo -e "${BOLD}Arguments:${NC}"
   echo "  <directory>               Optional. The root directory to start searching for Git repos."
@@ -65,6 +80,8 @@ usage() {
   echo "  -l                        List all repositories and their pull status."
   echo "  -v                        Used with -l to give verbose output (show files changed after fetch)."
   echo "  -h                        Display this help message and exit."
+  echo "  -a <author1,author2,...>  Filter to only include repositories where one of the specified authors has ever committed."
+  echo "                            Provide a comma-separated string with no spaces."
   exit 1
 }
 
@@ -77,6 +94,14 @@ while [[ "$#" -gt 0 ]]; do
         usage
       fi
       user_ignored_dirs="$2"
+      shift
+      ;;
+    -a)
+      if [[ -z "$2" || "$2" == -* ]]; then
+        echo -e "${RED}Error:${NC} '-a' requires a list of authors." >&2
+        usage
+      fi
+      user_authors="$2"
       shift
       ;;
     -l)
@@ -112,14 +137,20 @@ fi
 all_ignored_dirs=("${default_ignored_dirs[@]}")
 if [[ -n "$user_ignored_dirs" ]]; then
   IFS=',' read -ra user_dirs_array <<< "$user_ignored_dirs"
-  all_ignored_dirs+=("${user_dirs_array[@]}")
+  all_ignored_dirs=("${user_dirs_array[@]}")
 fi
-
 declare -A unique_dirs
 for dir in "${all_ignored_dirs[@]}"; do
   unique_dirs["$dir"]=1
 done
 final_ignored_dirs=("${!unique_dirs[@]}")
+
+all_authors=("${default_authors[@]}")
+if [[ -n "$user_authors" ]]; then
+  IFS=',' read -ra user_authors_array <<< "$user_authors"
+  all_authors=("${user_authors_array[@]}")
+fi
+final_authors="${user_authors:-${all_authors[*]}}"
 
 # --- Core Script Logic ---
 
@@ -128,62 +159,79 @@ if [[ ! -d "$root_directory" ]]; then
   exit 1
 fi
 
-ignore_expression=""
-for dir in "${final_ignored_dirs[@]}"; do
-  ignore_expression+="-path */$dir -prune -o "
-done
+process_single_repo() {
+  local git_dir="$1"
+  local repo_dir
+  repo_dir=$(dirname "$git_dir")
 
-process_repos() {
-  find "$root_directory" -type d \( $ignore_expression -false \) -o -name ".git" | while read git_dir; do
-    repo_dir=$(dirname "$git_dir")
-    
-    if ! git -C "$repo_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-      continue
+  if ! git -C "$repo_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    return
+  fi
+
+  if ! has_upstream "$repo_dir"; then
+    return
+  fi
+
+  local author_filter_passed=false
+  if [[ -n "$final_authors" ]]; then
+    if has_author_commits "$repo_dir" "$final_authors"; then
+      author_filter_passed=true
     fi
-    
-    # Check if there are updates to pull
-    git -C "$repo_dir" fetch --quiet 2>/dev/null
-    local_behind_remote=false
-    if [[ -n $(git -C "$repo_dir" log HEAD..@{u} --oneline 2>/dev/null) ]]; then
-        local_behind_remote=true
+  fi
+
+  if [[ -n "$final_authors" ]] && [[ "$author_filter_passed" == false ]]; then
+      return
+  fi
+
+  git -C "$repo_dir" fetch --quiet 2>/dev/null
+  local_behind_remote=false
+  if [[ -n $(git -C "$repo_dir" log HEAD..@{u} --oneline 2>/dev/null) ]]; then
+      local_behind_remote=true
+  fi
+
+  if [[ "$is_list_mode" = true ]]; then
+    if [[ "$local_behind_remote" = true ]]; then
+      echo -e "${YELLOW}Updates available in:${NC} ${BOLD}$repo_dir${NC}"
+    elif [[ -n "$final_authors" ]] && [[ "$author_filter_passed" == true ]]; then
+      echo -e "${YELLOW}Updates checked in:${NC} ${BOLD}$repo_dir${NC} (no updates available)."
     fi
 
-    if [[ "$is_list_mode" = true ]]; then
-      if [[ "$local_behind_remote" = true ]]; then
-        echo -e "${YELLOW}Updates available in:${NC} ${BOLD}$repo_dir${NC}"
-      else
-        echo -e "No updates available in: ${BOLD}$repo_dir${NC}"
-      fi
-      
-      if [[ "$is_verbose_list" = true && "$local_behind_remote" = true ]]; then
-        local changed_files=$(git -C "$repo_dir" diff --name-status HEAD..@{u})
-        echo "$changed_files" | awk '{print "  "$0}'
-      fi
-    else # Default mode: Pull updates
-      if [[ "$local_behind_remote" = true ]]; then
-        echo -e "${BOLD}--- Pulling updates in:${NC} ${CYAN}$repo_dir${NC}"
-        if git -C "$repo_dir" pull; then
-          echo -e "${GREEN}--- Successfully pulled updates in ${BOLD}$repo_dir${NC}."
-        else
-          echo -e "${RED}--- Failed to pull updates in ${BOLD}$repo_dir${NC}. Please check manually."
-        fi
-        echo -e "--- Finished with repository: ${CYAN}$repo_dir${NC}"
-        echo ""
-      else
-        echo -e "No updates available in: ${BOLD}$repo_dir${NC}"
-      fi
+    if [[ "$is_verbose_list" = true && "$local_behind_remote" = true ]]; then
+      local changed_files=$(git -C "$repo_dir" diff --name-status HEAD..@{u})
+      echo "$changed_files" | awk '{print "  "$0}'
     fi
-  done
+  else
+    if [[ "$local_behind_remote" = true ]]; then
+      echo -e "${BOLD}--- Pulling updates in:${NC} ${CYAN}$repo_dir${NC}"
+      if git -C "$repo_dir" pull; then
+        echo -e "${GREEN}--- Successfully pulled updates in ${BOLD}$repo_dir${NC}."
+      else
+        echo -e "${RED}--- Failed to pull updates in ${BOLD}$repo_dir${NC}. Please check manually."
+      fi
+      echo -e "--- Finished with repository: ${CYAN}$repo_dir${NC}"
+      echo ""
+    elif [[ -n "$final_authors" ]] && [[ "$author_filter_passed" == true ]]; then
+      echo -e "No updates available in: ${BOLD}$repo_dir${NC}"
+    fi
+  fi
 }
+
+# --- Execute ---
 
 if [[ "$is_list_mode" = true ]]; then
   echo -e "${BOLD}Listing all Git repositories in '${CYAN}$root_directory${NC}':"
-  process_repos
 else
   echo -e "${BOLD}Starting automated Git pull...${NC}"
   echo -e "Root directory: ${CYAN}$root_directory${NC}"
-  echo -e "Ignoring directories: ${YELLOW}${final_ignored_dirs[*]}${NC}"
-  echo ""
-  process_repos
-  echo -e "${GREEN}Script completed.${NC}"
 fi
+
+if [[ -n "$final_authors" ]]; then
+  echo -e "Filtering by authors: '${CYAN}$final_authors${NC}'"
+fi
+if [[ ${#final_ignored_dirs[@]} -gt 0 ]]; then
+  echo -e "Ignoring directories: ${YELLOW}${final_ignored_dirs[*]}${NC}"
+fi
+echo ""
+process_repos_common "$root_directory" "${final_ignored_dirs[@]}"
+
+echo -e "\n${BOLD}Finished git_pull_all.${NC}"

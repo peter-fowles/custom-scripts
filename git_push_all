@@ -11,49 +11,61 @@
 #   - List mode (-l) to preview all repositories, showing change status.
 #   - Verbose list mode (-lv) to also show changed files.
 #   - Robust error handling for invalid arguments and non-Git directories.
-#   - Color-coded output for improved readability.
+#   - Filter repositories to include only those with commits by specified authors.
+#   - Ignore repos without a configured upstream remote.
 #
 # Usage:
-#   gpa [<directory>] [-m <commit_message>] [-i <dir1,dir2,...>] [-l [-v]] [-p] [-h]
+#   git_push_all [<directory>] [-m <commit_message>] [-i <dir1,dir2,...>] [-l [-v]] [-p] [-h] [-a <author1,author2,...>]
 #
 # Examples:
 #   # Run in current directory with default automated message
-#   gpa
+#   git_push_all
 #
 #   # Run in a specific directory with a custom message
-#   gpa ~/projects -m "Update scripts and configuration"
+#   git_push_all ~/projects -m "Update scripts and configuration"
 #
 #   # Run in interactive mode, with a custom message offered as the default
-#   gpa -p -m "Review and push"
+#   git_push_all -p -m "Review and push"
 #
 #   # List all repos with pending changes, ignoring the 'temp' directory
-#   gpa -l -i "temp"
+#   git_push_all -l -i "temp"
 #
 #   # Verbose list, showing files changed
-#   gpa -lv
+#   git_push_all -lv
+#
+#   # Push changes only in repos with commits by 'John Doe' or 'jane@example.com'
+#   git_push_all -a "John Doe,jane@example.com"
 #
 # ==============================================================================
 
 # Fix for "fatal: not a git repository" errors across filesystems.
 export GIT_DISCOVERY_ACROSS_FILESYSTEM=1
 
+# Source common functions
+source "$(dirname "$0")/git_common.sh"
+
 # --- Configuration ---
 
-# Define the default directories to ignore
-default_ignored_dirs=("node_modules" "vendor" "build" ".venv")
+# File to load default settings from
+CONF_FILE="$(dirname "$0")/default_values.conf"
 
-# Define ANSI color codes
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m' # No Color
+# Initialize variables to be populated from the config file or defaults
+declare -a default_authors=()
+declare -a default_ignored_dirs=()
+
+# Load settings from the config file if it exists
+if [[ -f "$CONF_FILE" ]]; then
+  echo -e "${CYAN}Loading configuration from: ${BOLD}$CONF_FILE${NC}"
+  source "$CONF_FILE"
+else
+  echo -e "${YELLOW}Warning:${NC} No configuration file found at '$CONF_FILE'. Using empty defaults." >&2
+fi
 
 # --- Argument Parsing ---
 
 global_commit_message=""
 user_ignored_dirs=""
+user_authors=""
 is_list_mode=false
 is_verbose_list=false
 is_interactive_mode=false
@@ -63,7 +75,7 @@ timestamp=$(date +"%Y/%m/%d %H:%M:%S")
 commit_message="Automated commit $timestamp"
 
 usage() {
-  echo -e "${BOLD}Usage:${NC} $0 [<directory>] [-m <commit_message>] [-i <dir1,dir2,...>] [-l [-v]] [-p] [-h]"
+  echo -e "${BOLD}Usage:${NC} $0 [<directory>] [-m <commit_message>] [-i <dir1,dir2,...>] [-l [-v]] [-p] [-h] [-a <author1,author2,...>]"
   echo ""
   echo -e "${BOLD}Arguments:${NC}"
   echo "  <directory>               Optional. The root directory to start searching for Git repos."
@@ -77,6 +89,8 @@ usage() {
   echo "  -v                        Used with -l to give verbose output (list files changed)."
   echo "  -p                        Run in interactive mode, prompting per repository."
   echo "  -h                        Display this help message and exit."
+  echo "  -a <author1,author2,...>  Filter to only include repositories where one of the specified authors has ever committed."
+  echo "                            Provide a comma-separated string with no spaces."
   exit 1
 }
 
@@ -97,6 +111,14 @@ while [[ "$#" -gt 0 ]]; do
         usage
       fi
       user_ignored_dirs="$2"
+      shift
+      ;;
+    -a)
+      if [[ -z "$2" || "$2" == -* ]]; then
+        echo -e "${RED}Error:${NC} '-a' requires a list of authors." >&2
+        usage
+      fi
+      user_authors="$2"
       shift
       ;;
     -l)
@@ -144,7 +166,7 @@ fi
 all_ignored_dirs=("${default_ignored_dirs[@]}")
 if [[ -n "$user_ignored_dirs" ]]; then
   IFS=',' read -ra user_dirs_array <<< "$user_ignored_dirs"
-  all_ignored_dirs+=("${user_dirs_array[@]}")
+  all_ignored_dirs=("${user_dirs_array[@]}")
 fi
 
 declare -A unique_dirs
@@ -153,6 +175,13 @@ for dir in "${all_ignored_dirs[@]}"; do
 done
 final_ignored_dirs=("${!unique_dirs[@]}")
 
+all_authors=("${default_authors[@]}")
+if [[ -n "$user_authors" ]]; then
+  IFS=',' read -ra user_authors_array <<< "$user_authors"
+  all_authors=("${user_authors_array[@]}")
+fi
+final_authors="${user_authors:-${all_authors[*]}}"
+
 # --- Core Script Logic ---
 
 if [[ ! -d "$root_directory" ]]; then
@@ -160,51 +189,63 @@ if [[ ! -d "$root_directory" ]]; then
   exit 1
 fi
 
-ignore_expression=""
-for dir in "${final_ignored_dirs[@]}"; do
-  ignore_expression+="-path */$dir -prune -o "
-done
+process_single_repo() {
+  local git_dir="$1"
+  local repo_dir
+  repo_dir=$(dirname "$git_dir")
 
-process_repos() {
-  find "$root_directory" -type d \( $ignore_expression -false \) -o -name ".git" | while read git_dir; do
-    repo_dir=$(dirname "$git_dir")
-    
-    if ! git -C "$repo_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-      continue
+  if ! git -C "$repo_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    return
+  fi
+
+  if ! has_upstream "$repo_dir"; then
+    return
+  fi
+
+  local author_filter_passed=false
+  if [[ -n "$final_authors" ]]; then
+    if has_author_commits "$repo_dir" "$final_authors"; then
+      author_filter_passed=true
     fi
-    
-    has_changes=false
-    if git -C "$repo_dir" status --porcelain | grep -q .; then
-      has_changes=true
+  fi
+
+  if [[ -n "$final_authors" ]] && [[ "$author_filter_passed" == false ]]; then
+      return
+  fi
+
+  local has_changes=false
+  if git -C "$repo_dir" status --porcelain | grep -q .; then
+    has_changes=true
+  fi
+
+  if [[ -n "$final_authors" ]] && [[ "$author_filter_passed" == true ]] && [[ "$has_changes" == false ]]; then
+    echo -e "${YELLOW}Ignoring ${BOLD}$repo_dir${NC}: No changes to commit, but includes commits by given authors."
+    return
+  fi
+
+  if [[ "$is_list_mode" = true ]]; then
+    if [[ "$has_changes" = true ]]; then
+        echo -e "${YELLOW}Found pending changes in:${NC} ${BOLD}$repo_dir${NC}"
     fi
-    
-    if [[ "$is_list_mode" = true ]]; then
-      # New: Show repository name regardless of changes
-      if [[ "$has_changes" = true ]]; then
-          echo -e "${YELLOW}Found pending changes in:${NC} ${BOLD}$repo_dir${NC}"
-      else
-          echo -e "No pending changes in: ${BOLD}$repo_dir${NC}"
-      fi
-      
-      # If verbose, and there are changes, list the files
-      if [[ "$is_verbose_list" = true && "$has_changes" = true ]]; then
-        local changed_files=$( { git -C "$repo_dir" diff --name-status; git -C "$repo_dir" diff --name-status --staged; } | sort -u )
-        echo "$changed_files" | awk '{print "  "$0}'
-      fi
-    elif [[ "$is_interactive_mode" = true ]]; then
-      if [[ "$has_changes" = true ]]; then
-        echo -e "\n${BOLD}--- Found pending changes in: ${CYAN}$repo_dir${NC}"
-        
-        echo -e "\n${BOLD}--- Unstaged changes:${NC}"
-        git -C "$repo_dir" diff --color
-        echo -e "\n${BOLD}--- Staged changes:${NC}"
-        git -C "$repo_dir" diff --staged --color
-        
-        read -p "$(echo -e "${CYAN}Do you want to commit and push these changes? (y/n/s) [y=yes, n=no, s=skip all]: ${NC}")" -r user_choice
-        
-        case "$user_choice" in
-          [Yy]* )
-            read -p "$(echo -e "${CYAN}Enter custom commit message (default: \"$commit_message\"): ${NC}")" -r custom_message
+
+    if [[ "$is_verbose_list" = true && "$has_changes" = true ]]; then
+      local changed_files=$( { git -C "$repo_dir" diff --name-status; git -C "$repo_dir" diff --name-status --staged; } | sort -u )
+      echo "$changed_files" | awk '{print "  "$0}'
+    fi
+  elif [[ "$is_interactive_mode" = true ]]; then
+    if [[ "$has_changes" = true ]]; then
+      echo -e "\n${BOLD}--- Found pending changes in: ${CYAN}$repo_dir${NC}"
+
+      echo -e "\n${BOLD}--- Unstaged changes:${NC}"
+      git -C "$repo_dir" diff --color
+      echo -e "\n${BOLD}--- Staged changes:${NC}"
+      git -C "$repo_dir" diff --staged --color
+
+      read -p "$(echo -e "${CYAN}Do you want to commit and push these changes? (y/n/s) [y=yes, n=no, s=skip all]: ${NC}")" -r user_choice
+
+      case "$user_choice" in
+        [Yy]* )
+          read -p "$(echo -e "${CYAN}Enter custom commit message (default: \"$commit_message\"): ${NC}")" -r custom_message
             if [[ -z "$custom_message" ]]; then
               custom_message="$commit_message"
             fi
@@ -214,48 +255,45 @@ process_repos() {
               echo -e "${RED}--- Failed to commit or push in ${BOLD}$repo_dir${NC}. Please check manually."
             fi
             ;;
-          [Nn]* )
-            echo -e "${YELLOW}--- Skipping commit for ${BOLD}$repo_dir${NC}."
-            ;;
-          [Ss]* )
-            echo -e "${YELLOW}--- Skipping ${BOLD}$repo_dir${NC} and all remaining repositories."
-            exit 0
-            ;;
-          * )
-            echo -e "${RED}--- Invalid input. Skipping ${BOLD}$repo_dir${NC}."
-            ;;
-        esac
-      fi
-    else
-      if [[ "$has_changes" = true ]]; then
-        echo -e "${BOLD}--- Entering repository:${NC} ${CYAN}$repo_dir${NC}"
-        if git -C "$repo_dir" add . && git -C "$repo_dir" commit -m "$commit_message" && git -C "$repo_dir" push; then
-          echo -e "${GREEN}--- Successfully committed and pushed in ${BOLD}$repo_dir${NC}."
-        else
-          echo -e "${RED}--- Failed to commit or push in ${BOLD}$repo_dir${NC}. Please check manually."
-        fi
-        echo -e "--- Finished with repository: ${CYAN}$repo_dir${NC}"
-        echo ""
+        [Nn]* )
+          echo -e "${YELLOW}--- Skipping commit for ${BOLD}$repo_dir${NC}."
+          ;;
+        [Ss]* )
+          echo -e "${YELLOW}--- Skipping ${BOLD}$repo_dir${NC} and all remaining repositories."
+          exit 0
+          ;;
+        * )
+          echo -e "${RED}--- Invalid input. Skipping ${BOLD}$repo_dir${NC}."
+          ;;
+      esac
+    fi
+  else
+    if [[ "$has_changes" = true ]]; then
+      echo -e "${BOLD}--- Entering repository:${NC} ${CYAN}$repo_dir${NC}"
+      if git -C "$repo_dir" add . && git -C "$repo_dir" commit -m "$commit_message" && git -C "$repo_dir" push; then
+        echo -e "${GREEN}--- Successfully committed and pushed in ${BOLD}$repo_dir${NC}."
+      else
+        echo -e "${RED}--- Failed to commit or push in ${BOLD}$repo_dir${NC}. Please check manually."
       fi
     fi
-  done
+  fi
 }
 
-if [[ "$is_list_mode" = true ]]; then
-  echo -e "${BOLD}Listing all Git repositories in '${CYAN}$root_directory${NC}':"
-  process_repos
-elif [[ "$is_interactive_mode" = true ]]; then
-  echo -e "${BOLD}Starting interactive Git commit and push...${NC}"
-  echo -e "Root directory: ${CYAN}$root_directory${NC}"
-  echo -e "Ignoring directories: ${YELLOW}${final_ignored_dirs[*]}${NC}"
-  process_repos
-  echo -e "${GREEN}Interactive process completed.${NC}"
-else
-  echo -e "${BOLD}Starting automated Git commit and push...${NC}"
-  echo -e "Root directory: ${CYAN}$root_directory${NC}"
-  echo -e "Using commit message: \"${BOLD}$commit_message${NC}\""
-  echo -e "Ignoring directories: ${YELLOW}${final_ignored_dirs[*]}${NC}"
-  echo ""
-  process_repos
-  echo -e "${GREEN}Script completed.${NC}"
+
+# --- Execute ---
+
+if [[ "$is_list_mode" = false ]]; then
+  echo -e "${BOLD}Starting git_push_all...${NC}"
+  if [[ -n "$global_commit_message" ]]; then
+    echo -e "Using global commit message: '${CYAN}$global_commit_message${NC}'"
+  fi
+  if [[ -n "$final_authors" ]]; then
+    echo -e "Filtering by authors: '${CYAN}$final_authors${NC}'"
+  else
+    echo -e "No author filter specified, processing all repositories."
+  fi
 fi
+
+process_repos_common "$root_directory" "${final_ignored_dirs[@]}"
+
+echo -e "\n${BOLD}Finished git_push_all.${NC}"
